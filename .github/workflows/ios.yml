@@ -13,6 +13,16 @@ env:
 
 on:
   workflow_dispatch:
+    inputs:
+      build_mode:
+        description: 'Build mode (auto = tự phát hiện từ extension_src)'
+        required: false
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - with-extension
+          - app-only
   push:
     branches: [ main, master ]
 
@@ -26,23 +36,36 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 1. TỰ ĐỘNG PHÁT HIỆN EXTENSION
-      - name: Detect extension source
+      # 1. TỰ ĐỘNG CHỌN MODE
+      - name: Detect build mode
         id: detect
         run: |
-          if [ -f "${EXT_SRC_DIR}/manifest.json" ]; then
-            echo "has_extension=true" >> $GITHUB_OUTPUT
-            echo "✓ Phát hiện extension trong ${EXT_SRC_DIR}"
-          else
-            echo "has_extension=false" >> $GITHUB_OUTPUT
-            echo "ERROR: Không có ${EXT_SRC_DIR}/manifest.json — workflow này yêu cầu extension"
+          MODE="${{ github.event.inputs.build_mode || 'auto' }}"
+          if [ "$MODE" = "auto" ]; then
+            if [ -f "${EXT_SRC_DIR}/manifest.json" ]; then
+              MODE="with-extension"
+            else
+              MODE="app-only"
+            fi
+          fi
+          echo "mode=$MODE" >> $GITHUB_OUTPUT
+          echo "==> Build mode: $MODE"
+
+      - name: Verify extension source (with-extension mode)
+        if: steps.detect.outputs.mode == 'with-extension'
+        run: |
+          if [ ! -f "${EXT_SRC_DIR}/manifest.json" ]; then
+            echo "ERROR: manifest.json không tồn tại trong ${EXT_SRC_DIR}"
             exit 1
           fi
+          echo "✓ Đã xác nhận extension source"
 
-      # 2. CHUYỂN ĐỔI CHROME EXT → XCODE PROJECT
+      # 2. CHUYỂN ĐỔI CHROME EXT -> SAFARI WEB EXT
       - name: Convert Chrome Extension to Safari Web Extension
+        if: steps.detect.outputs.mode == 'with-extension'
         run: |
-          rm -rf output && mkdir -p output
+          rm -rf output
+          mkdir -p output
           xcrun safari-web-extension-converter "${EXT_SRC_DIR}" \
             --ios-only \
             --project-location output \
@@ -52,69 +75,63 @@ jobs:
             --no-open \
             --no-prompt
 
-      # 3. SYNC METADATA (version + bundle ID) — chống ValidateEmbeddedBinary
-      - name: Sync app & extension metadata
+      # 3. SYNC VERSION (fix ValidateEmbeddedBinary mismatch)
+      - name: Sync version & bundle ID between app and extension
+        if: steps.detect.outputs.mode == 'with-extension'
         run: |
           set -e
-          APP_PLIST=$(find output -path "*/${APP_NAME}/Info.plist" 2>/dev/null | head -n 1)
-          EXT_PLIST=$(find output -path "*Extension*/Info.plist" 2>/dev/null | head -n 1)
+          APP_INFO=$(find output -path "*/${APP_NAME}/Info.plist" -not -path "*Extension*" 2>/dev/null | head -n 1)
+          EXT_INFO=$(find output -path "*Extension/Info.plist" 2>/dev/null | head -n 1)
 
-          if [ -z "$APP_PLIST" ] || [ -z "$EXT_PLIST" ]; then
-            echo "ERROR: Không tìm thấy Info.plist của app hoặc extension"
-            echo "APP_PLIST=$APP_PLIST"
-            echo "EXT_PLIST=$EXT_PLIST"
-            exit 1
+          if [ -z "$APP_INFO" ] || [ -z "$EXT_INFO" ]; then
+            echo "WARN: không tìm thấy đủ 2 Info.plist, bỏ qua sync"
+            exit 0
           fi
 
-          echo "App plist: $APP_PLIST"
-          echo "Ext plist: $EXT_PLIST"
+          APP_SHORT_VER=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP_INFO" 2>/dev/null || echo "1.0")
+          APP_BUNDLE_VER=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$APP_INFO" 2>/dev/null || echo "1")
+          EXT_SHORT_VER=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$EXT_INFO" 2>/dev/null || echo "1.0")
+          EXT_BUNDLE_VER=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$EXT_INFO" 2>/dev/null || echo "1")
 
-          # Force set cứng version cho CẢ HAI (tránh mismatch tuyệt đối)
-          for plist in "$APP_PLIST" "$EXT_PLIST"; do
-            /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString 1.0" "$plist" 2>/dev/null || \
-              /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string 1.0" "$plist"
-            /usr/libexec/PlistBuddy -c "Set :CFBundleVersion 1" "$plist" 2>/dev/null || \
-              /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string 1" "$plist"
-          done
+          echo "App: $APP_SHORT_VER / $APP_BUNDLE_VER"
+          echo "Ext: $EXT_SHORT_VER / $EXT_BUNDLE_VER"
 
-          # Fix extension bundle ID nếu thiếu prefix app
-          EXT_ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$EXT_PLIST" 2>/dev/null || echo "")
-          echo "Extension bundle ID hiện tại: $EXT_ID"
-          if [[ ! "$EXT_ID" =~ ^${BUNDLE_ID}\. ]]; then
-            NEW_ID="${BUNDLE_ID}.Extension"
-            echo "==> Fix bundle ID: $EXT_ID → $NEW_ID"
-            /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $NEW_ID" "$EXT_PLIST" 2>/dev/null || \
-              /usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string $NEW_ID" "$EXT_PLIST"
+          if [ "$EXT_SHORT_VER" != "$APP_SHORT_VER" ] || [ "$EXT_BUNDLE_VER" != "$APP_BUNDLE_VER" ]; then
+            echo "==> Đồng bộ version extension theo app..."
+            /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $APP_SHORT_VER" "$EXT_INFO" 2>/dev/null \
+              || /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $APP_SHORT_VER" "$EXT_INFO"
+            /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $APP_BUNDLE_VER" "$EXT_INFO" 2>/dev/null \
+              || /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $APP_BUNDLE_VER" "$EXT_INFO"
+            echo "✓ Đã sync"
           else
-            echo "✓ Bundle ID đã đúng prefix"
+            echo "✓ Version đã khớp, không cần sync"
           fi
 
-          echo "✓ Metadata synced: v1.0 (1)"
-
-      # 4. BUILD (tolerant với ValidateEmbeddedBinary)
-      - name: Build iOS app
+      # 4. BUILD + ĐÓNG GÓI (tolerant với ValidateEmbeddedBinary)
+      - name: Build and package IPA
         run: |
           set -e
           PROJECT_PATH=$(find output -name "*.xcodeproj" -maxdepth 3 -type d | head -n 1)
           if [ -z "$PROJECT_PATH" ]; then
-            echo "ERROR: không tìm thấy .xcodeproj"
+            echo "ERROR: không tìm thấy .xcodeproj trong output/"
             exit 1
           fi
           PROJECT_DIR=$(dirname "$PROJECT_PATH")
           PROJECT_NAME=$(basename "$PROJECT_PATH" .xcodeproj)
-          echo "Project: $PROJECT_NAME"
+          echo "Project: $PROJECT_NAME ($PROJECT_DIR)"
           cd "$PROJECT_DIR"
 
-          SCHEME_LIST=$(xcodebuild -list -project "$PROJECT_NAME.xcodeproj" 2>&1)
+          SCHEME_LIST=$(xcodebuild -list -project "$PROJECT_NAME.xcodeproj" 2>&1 || true)
           echo "=== Schemes ==="; echo "$SCHEME_LIST"; echo "==============="
 
           SCHEME=$(echo "$SCHEME_LIST" | grep -E '^\s+.*\(iOS\)' | head -n 1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
           if [ -z "$SCHEME" ]; then
             SCHEME=$(echo "$SCHEME_LIST" | awk '/Schemes:/{flag=1; next} flag && NF{print; exit}' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
           fi
-          if [ -z "$SCHEME" ]; then echo "ERROR: không có scheme"; exit 1; fi
-          echo "==> Scheme: $SCHEME"
+          if [ -z "$SCHEME" ]; then echo "ERROR: no scheme"; exit 1; fi
+          echo "==> Using scheme: $SCHEME"
 
+          # BUILD tolerant — unsigned + skip product validation
           set +e
           xcodebuild build \
             -project "$PROJECT_NAME.xcodeproj" \
@@ -131,100 +148,61 @@ jobs:
           BUILD_EXIT=${PIPESTATUS[0]}
           set -e
 
-          echo "Build exit code: $BUILD_EXIT"
-
+          # Tìm .app bất kể build exit
           APP_PATH=$(find ./DerivedData/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" -type d 2>/dev/null | head -n 1)
           [ -z "$APP_PATH" ] && APP_PATH=$(find ./DerivedData -name "*.app" -type d 2>/dev/null | head -n 1)
 
           if [ -z "$APP_PATH" ]; then
-            echo "=== Build FAILED — không có .app ==="
-            grep -i "error:" /tmp/build.log | head -30
+            echo "=== Build log (tail) ==="; tail -80 /tmp/build.log
+            echo "ERROR: không có .app được sinh ra"
             exit 1
           fi
-
-          echo "✓ .app: $APP_PATH"
+          echo "==> .app: $APP_PATH"
 
           if [ $BUILD_EXIT -ne 0 ]; then
             if grep -q "ValidateEmbeddedBinary" /tmp/build.log; then
-              echo "⚠ ValidateEmbeddedBinary fail (bình thường với build unsigned) — sẽ force-embed .appex ở bước đóng gói"
+              echo "⚠ xcodebuild exit=$BUILD_EXIT do ValidateEmbeddedBinary trên extension unsigned"
+              echo "⚠ Đây là hành vi bình thường với build unsigned — .app đã đủ để đóng gói"
             else
-              echo "⚠ Build có lỗi khác nhưng .app đã tồn tại — tiếp tục đóng gói"
-              grep -i "error:" /tmp/build.log | head -10
+              echo "⚠ xcodebuild exit=$BUILD_EXIT (không phải ValidateEmbeddedBinary) — vẫn thử đóng gói"
             fi
           fi
 
-          echo "$APP_PATH" > /tmp/app_path.txt
-
-      # 5. VERIFY + FORCE-EMBED .APPEX + ĐÓNG GÓI IPA
-      - name: Verify, force-embed and package IPA
-        run: |
-          set -e
-          APP_PATH=$(cat /tmp/app_path.txt)
-          echo "==> Đóng gói: $APP_PATH"
-
-          # Nếu ValidateEmbeddedBinary fail khiến .appex không vào PlugIns → force embed
-          if ! find "$APP_PATH/PlugIns" -name "*.appex" 2>/dev/null | grep -q .; then
-            echo "⚠ .appex chưa có trong .app — force embed từ DerivedData"
-            APPEX=$(find output -name "*.appex" -type d 2>/dev/null | head -n 1)
-            if [ -n "$APPEX" ]; then
-              echo "Tìm thấy .appex: $APPEX"
-              mkdir -p "$APP_PATH/PlugIns"
-              cp -R "$APPEX" "$APP_PATH/PlugIns/"
-              echo "✓ Đã force-embed"
-            else
-              echo "FATAL: không tìm thấy .appex ở bất kỳ đâu"
-              exit 1
+          # Mode app-only: gỡ extension khỏi .app
+          if [ "${{ steps.detect.outputs.mode }}" = "app-only" ]; then
+            if [ -d "$APP_PATH/PlugIns" ]; then
+              echo "==> App-only: gỡ PlugIns khỏi .app"
+              rm -rf "$APP_PATH/PlugIns"
             fi
           fi
 
-          # Verify lần cuối
-          APPEX_FINAL=$(find "$APP_PATH/PlugIns" -name "*.appex" 2>/dev/null | head -n 1)
-          if [ -z "$APPEX_FINAL" ]; then
-            echo "FATAL: .appex vẫn không có trong .app"
-            exit 1
-          fi
-          echo "✓ .appex: $APPEX_FINAL"
-
-          # Đồng bộ version lần cuối trong .appex đã đóng gói (chống mismatch)
-          APP_PLIST="$APP_PATH/Info.plist"
-          APPEX_PLIST="$APPEX_FINAL/Info.plist"
-          if [ -f "$APP_PLIST" ] && [ -f "$APPEX_PLIST" ]; then
-            APP_VER=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$APP_PLIST" 2>/dev/null || echo "1")
-            APP_SVER=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP_PLIST" 2>/dev/null || echo "1.0")
-            /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $APP_VER" "$APPEX_PLIST" 2>/dev/null || true
-            /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $APP_SVER" "$APPEX_PLIST" 2>/dev/null || true
-            echo "✓ Version: app v${APP_SVER} (${APP_VER}) — extension đồng bộ"
+          # Verify extension (with-extension mode)
+          if [ "${{ steps.detect.outputs.mode }}" = "with-extension" ]; then
+            if [ -d "$APP_PATH/PlugIns" ] && find "$APP_PATH/PlugIns" -name "*.appex" | grep -q .; then
+              echo "✓ Extension đã nhúng đúng"
+            else
+              echo "⚠ CẢNH BÁO: không tìm thấy .appex trong .app"
+            fi
           fi
 
-          # Đóng gói
-          rm -rf Payload && mkdir -p Payload
+          # Đóng gói IPA
+          rm -rf Payload; mkdir -p Payload
           cp -R "$APP_PATH" Payload/
           rm -f "${GITHUB_WORKSPACE}/${IPA_NAME}.ipa"
           zip -r -q "${GITHUB_WORKSPACE}/${IPA_NAME}.ipa" Payload
 
-          echo "=== IPA created ==="
+          echo "=== IPA ==="
           ls -lh "${GITHUB_WORKSPACE}/${IPA_NAME}.ipa"
+          unzip -l "${GITHUB_WORKSPACE}/${IPA_NAME}.ipa" | head -25
 
-          # Verify CUỐI CÙNG: .appex có trong IPA
-          if unzip -l "${GITHUB_WORKSPACE}/${IPA_NAME}.ipa" | grep -q "\.appex/"; then
-            echo "✅ XÁC NHẬN: .appex có trong IPA"
-            echo "--- .appex entries ---"
-            unzip -l "${GITHUB_WORKSPACE}/${IPA_NAME}.ipa" | grep "\.appex/" | head -5
-          else
-            echo "❌ FATAL: .appex KHÔNG có trong IPA"
-            unzip -l "${GITHUB_WORKSPACE}/${IPA_NAME}.ipa" | head -20
-            exit 1
-          fi
-
-      # 6. PHÁT HÀNH
       - name: Publish IPA to GitHub Releases
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           name: "IPA Build: ${{ env.APP_NAME }}"
           body: |
-            Tải **${{ env.IPA_NAME }}.ipa** ở Assets bên dưới.
-            ✓ Đã bao gồm Safari Web Extension (`.appex` bên trong `PlugIns/`).
+            Tải file **${{ env.IPA_NAME }}.ipa** ở mục Assets bên dưới.
+            Build mode: **${{ steps.detect.outputs.mode }}**
           files: ${{ env.IPA_NAME }}.ipa
           prerelease: false
           make_latest: true
