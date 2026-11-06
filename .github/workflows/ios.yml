@@ -1,0 +1,133 @@
+name: Google Pro
+
+# =====================================================================
+# KHU VỰC CẤU HÌNH NHANH (Chỉ cần sửa thông tin tại đây)
+# =====================================================================
+env:
+  EXT_SRC_DIR: "extension_src"          # Thư mục chứa manifest.json và code extension
+  APP_NAME: "GooglePro"               # Tên ứng dụng hiển thị trên màn hình iOS
+  BUNDLE_ID: "com.qhuy.googlepro"     # Bundle ID của ứng dụng
+  IPA_NAME: "gg-pro"                     # Tên file IPA xuất ra (không cần gõ đuôi .ipa)
+  ARTIFACT_NAME: "ggpro-extension"       # Tên lưu trữ trong mục Artifacts
+  RELEASE_TAG: "latest-ipa"             # Nhãn Release để tải trực tiếp file .ipa
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+# Cấp quyền ghi để workflow tự động tạo Release chứa file .ipa trực tiếp
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 1. Kiểm tra manifest.json tồn tại trực tiếp trong thư mục nguồn
+      - name: Verify manifest.json
+        run: |
+          if [ ! -f "${EXT_SRC_DIR}/manifest.json" ]; then
+            echo "Error: manifest.json not found in ${EXT_SRC_DIR}"
+            exit 1
+          fi
+
+      # 2. Chuyển đổi Chrome Extension sang Safari Web Extension (chỉ iOS)
+      - name: Convert Chrome Extension to Safari Web Extension
+        run: |
+          rm -rf output
+          mkdir -p output
+          xcrun safari-web-extension-converter "${EXT_SRC_DIR}" \
+            --ios-only \
+            --project-location output \
+            --app-name "${APP_NAME}" \
+            --bundle-identifier "${BUNDLE_ID}" \
+            --swift \
+            --no-open \
+            --no-prompt
+
+      # 3. Build unsigned IPA với scheme và .app được tự động phát hiện
+      - name: Build unsigned IPA
+        run: |
+          set -e
+          PROJECT_PATH=$(find output -name "*.xcodeproj" -maxdepth 3 -type d | head -n 1)
+          if [ -z "$PROJECT_PATH" ]; then
+            echo "Error: .xcodeproj not found in output"
+            exit 1
+          fi
+          PROJECT_DIR=$(dirname "$PROJECT_PATH")
+          PROJECT_NAME=$(basename "$PROJECT_PATH" .xcodeproj)
+          echo "Project directory: $PROJECT_DIR"
+          echo "Project name: $PROJECT_NAME"
+
+          cd "$PROJECT_DIR"
+
+          # Liệt kê scheme để debug
+          echo "Listing schemes..."
+          SCHEME_LIST=$(xcodebuild -list -project "$PROJECT_NAME.xcodeproj" 2>&1)
+          echo "$SCHEME_LIST"
+
+          # Tự động tìm scheme iOS
+          SCHEME=$(echo "$SCHEME_LIST" | grep -E '^\s+.*\(iOS\)' | head -n 1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+          if [ -z "$SCHEME" ]; then
+            echo "No scheme with (iOS) found, trying first available scheme..."
+            SCHEME=$(echo "$SCHEME_LIST" | awk '/Schemes:/{flag=1; next} flag && NF{print; exit}' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+          fi
+          if [ -z "$SCHEME" ]; then
+            echo "Error: No scheme found"
+            exit 1
+          fi
+          echo "Using scheme: $SCHEME"
+
+          # Build Release không ký (unsigned)
+          xcodebuild clean build \
+            -project "$PROJECT_NAME.xcodeproj" \
+            -scheme "$SCHEME" \
+            -sdk iphoneos \
+            -configuration Release \
+            -derivedDataPath ./DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES
+
+          # Tìm file .app trong DerivedData (ưu tiên Release-iphoneos để tránh nhầm .appex)
+          echo "Searching for .app in DerivedData..."
+          APP_PATH=$(find ./DerivedData/Build/Products/Release-iphoneos -name "*.app" -maxdepth 1 -type d 2>/dev/null | head -n 1)
+          if [ -z "$APP_PATH" ]; then
+            APP_PATH=$(find ./DerivedData -name "*.app" -type d | head -n 1)
+          fi
+          if [ -z "$APP_PATH" ]; then
+            echo "Error: .app not found anywhere"
+            exit 1
+          fi
+          echo "Found .app at: $APP_PATH"
+
+          # Đóng gói IPA
+          rm -rf Payload
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/
+          zip -r -q "${GITHUB_WORKSPACE}/${IPA_NAME}.ipa" Payload
+          echo "Created IPA at: ${GITHUB_WORKSPACE}/${IPA_NAME}.ipa"
+
+      # 4. Đẩy trực tiếp file .ipa sang mục Releases (Tải thẳng .ipa không bị nén .zip)
+      - name: Publish Direct IPA to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: "IPA Build: ${{ env.APP_NAME }}"
+          body: "Tải trực tiếp file **${{ env.IPA_NAME }}.ipa** ở mục Assets bên dưới (file nguyên bản, không bị nén thành .zip)."
+          files: ${{ env.IPA_NAME }}.ipa
+          prerelease: false
+          make_latest: true
+
+      # 5. Lưu thêm bản dự phòng ở mục Artifacts (tắt nén chồng lớp)
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.IPA_NAME }}.ipa
+          compression-level: 0
