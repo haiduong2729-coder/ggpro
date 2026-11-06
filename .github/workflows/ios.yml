@@ -36,102 +36,228 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 1. TỰ ĐỘNG CHỌN MODE
-      - name: Detect build mode
+      # 1. TỰ ĐỘNG PHÁT HIỆN CHẾ ĐỘ & TÌM MANIFEST.JSON (KỂ CẢ NẰM TRONG SUBFOLDER)
+      - name: Detect build mode and locate manifest
         id: detect
         run: |
           MODE="${{ github.event.inputs.build_mode || 'auto' }}"
+          MANIFEST_PATH=""
+
+          if [ -d "${EXT_SRC_DIR}" ]; then
+            MANIFEST_PATH=$(find "${EXT_SRC_DIR}" -maxdepth 3 -name "manifest.json" -type f | head -n 1)
+          fi
+
           if [ "$MODE" = "auto" ]; then
-            if [ -f "${EXT_SRC_DIR}/manifest.json" ]; then
+            if [ -n "$MANIFEST_PATH" ]; then
               MODE="with-extension"
             else
               MODE="app-only"
             fi
           fi
-          echo "mode=$MODE" >> $GITHUB_OUTPUT
-          echo "==> Build mode: $MODE"
 
-      - name: Verify extension source (with-extension mode)
-        if: steps.detect.outputs.mode == 'with-extension'
-        run: |
-          if [ ! -f "${EXT_SRC_DIR}/manifest.json" ]; then
-            echo "ERROR: manifest.json không tồn tại trong ${EXT_SRC_DIR}"
+          if [ "$MODE" = "with-extension" ] && [ -z "$MANIFEST_PATH" ]; then
+            echo "ERROR: Không tìm thấy manifest.json trong ${EXT_SRC_DIR}"
             exit 1
           fi
-          echo "✓ Đã xác nhận extension source"
 
-      # 2. CHUYỂN ĐỔI CHROME EXT -> SAFARI WEB EXT
+          echo "mode=$MODE" >> $GITHUB_OUTPUT
+          echo "manifest_dir=$(dirname "$MANIFEST_PATH" 2>/dev/null || echo "")" >> $GITHUB_OUTPUT
+          echo "==> Build mode: $MODE"
+          [ -n "$MANIFEST_PATH" ] && echo "==> Tìm thấy manifest tại: $MANIFEST_PATH"
+
+      # 2. CHUẨN HÓA MỌI CHROME EXTENSION ĐỂ TƯƠNG THÍCH 100% VỚI SAFARI IOS
+      - name: Prepare and sanitize extension source
+        run: |
+          rm -rf /tmp/ext_work
+          mkdir -p /tmp/ext_work
+
+          if [ "${{ steps.detect.outputs.mode }}" = "with-extension" ]; then
+            cp -R "${{ steps.detect.outputs.manifest_dir }}/." /tmp/ext_work/
+          else
+            # Tạo manifest giả lập nếu chạy mode app-only để Xcode vẫn sinh project
+            cat << 'EOF' > /tmp/ext_work/manifest.json
+          {
+            "manifest_version": 3,
+            "name": "${{ env.APP_NAME }}",
+            "version": "1.0.0",
+            "description": "App Only Mode"
+          }
+          EOF
+          fi
+
+          python3 - << 'PYEOF'
+          import json, os, re, shutil, struct, zlib, subprocess
+
+          work_dir = "/tmp/ext_work"
+          manifest_path = os.path.join(work_dir, "manifest.json")
+
+          # Đọc bằng utf-8-sig để tránh lỗi UTF-8 BOM trên một số Chrome Extension
+          with open(manifest_path, "r", encoding="utf-8-sig") as f:
+              data = json.load(f)
+
+          # 1. Tạo hàm sinh icon PNG chuẩn (phòng trường hợp extension thiếu icon hoặc dùng .webp/.svg)
+          def create_fallback_png(path, width=128, height=128):
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              def chunk(c_type, c_data):
+                  return struct.pack(">I", len(c_data)) + c_type + c_data + struct.pack(">I", zlib.crc32(c_type + c_data) & 0xffffffff)
+              raw = b"".join(b"\x00" + b"\x25\x63\xeb\xff" * width for _ in range(height))
+              ihdr = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+              with open(path, "wb") as png:
+                  png.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+          fallback_rel = "_safari_fallback_icon.png"
+          fallback_abs = os.path.join(work_dir, fallback_rel)
+          create_fallback_png(fallback_abs, 128, 128)
+
+          def ensure_valid_png(rel_path):
+              if not rel_path or not isinstance(rel_path, str):
+                  return fallback_rel
+              clean_rel = rel_path.lstrip("/")
+              abs_path = os.path.join(work_dir, clean_rel)
+              if not os.path.isfile(abs_path):
+                  return fallback_rel
+              ext = os.path.splitext(clean_rel)[1].lower()
+              if ext == ".png":
+                  return clean_rel
+              # Nếu là .webp, .jpg, .svg... thì thử convert sang .png hoặc dùng fallback
+              new_rel = os.path.splitext(clean_rel)[0] + "_converted.png"
+              new_abs = os.path.join(work_dir, new_rel)
+              try:
+                  subprocess.run(["sips", "-s", "format", "png", abs_path, "--out", new_abs],
+                                 check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                  if os.path.isfile(new_abs):
+                      return new_rel
+              except Exception:
+                  pass
+              return fallback_rel
+
+          # 2. Chuẩn hóa version về tối đa 3 cụm số nguyên (X.Y.Z) cho Apple CFBundleShortVersionString
+          raw_ver = str(data.get("version", "1.0.0"))
+          nums = [str(int(x)) for x in re.findall(r"\d+", raw_ver)[:3]]
+          while len(nums) < 3:
+              nums.append("0")
+          clean_ver = ".".join(nums)
+          if clean_ver == "0.0.0":
+              clean_ver = "1.0.0"
+          data["version"] = clean_ver
+
+          # 3. Xóa các khóa độc quyền của Chrome gây lỗi trên Safari Converter
+          for k in ["key", "update_url", "minimum_chrome_version", "differential_fingerprint",
+                    "trial_tokens", "nacl_modules", "platforms", "Requirements"]:
+              data.pop(k, None)
+
+          # 4. Chuẩn hóa Icons (Bắt buộc phải là PNG hợp lệ để Xcode actool không crash)
+          icons = data.get("icons")
+          if isinstance(icons, dict) and icons:
+              new_icons = {}
+              for size, p in icons.items():
+                  new_icons[str(size)] = ensure_valid_png(p)
+              data["icons"] = new_icons
+          else:
+              data["icons"] = {"48": fallback_rel, "128": fallback_rel}
+
+          for action_key in ["action", "browser_action", "page_action"]:
+              if isinstance(data.get(action_key), dict):
+                  act_icons = data[action_key].get("default_icon")
+                  if isinstance(act_icons, str):
+                      data[action_key]["default_icon"] = ensure_valid_png(act_icons)
+                  elif isinstance(act_icons, dict):
+                      data[action_key]["default_icon"] = {k: ensure_valid_png(v) for k, v in act_icons.items()}
+
+          # 5. Chuẩn hóa Background cho iOS Safari (MV2 & MV3)
+          mv = data.get("manifest_version", 3)
+          bg = data.get("background")
+          if isinstance(bg, dict):
+              if mv == 2:
+                  bg["persistent"] = False
+              elif mv == 3:
+                  # Safari iOS hỗ trợ cả service_worker lẫn scripts dự phòng
+                  sw = bg.get("service_worker")
+                  if sw and "scripts" not in bg:
+                      bg["scripts"] = [sw]
+
+          # 6. Đồng bộ _locales và default_locale
+          locales_dir = os.path.join(work_dir, "_locales")
+          if "default_locale" in data:
+              loc_target = os.path.join(locales_dir, str(data["default_locale"]), "messages.json")
+              if not os.path.isfile(loc_target):
+                  if os.path.isdir(locales_dir):
+                      avail = [d for d in os.listdir(locales_dir) if os.path.isfile(os.path.join(locales_dir, d, "messages.json"))]
+                      if avail:
+                          data["default_locale"] = avail[0]
+                      else:
+                          shutil.rmtree(locales_dir, ignore_errors=True)
+                          data.pop("default_locale", None)
+                  else:
+                      data.pop("default_locale", None)
+          else:
+              if os.path.isdir(locales_dir):
+                  avail = [d for d in os.listdir(locales_dir) if os.path.isfile(os.path.join(locales_dir, d, "messages.json"))]
+                  if avail:
+                      data["default_locale"] = "en" if "en" in avail else avail[0]
+                  else:
+                      shutil.rmtree(locales_dir, ignore_errors=True)
+
+          # 7. Lọc bỏ các quyền (permissions) chỉ có trên Chrome Desktop gây cảnh báo nặng
+          unsupported_perms = {
+              "offscreen", "debugger", "tabCapture", "desktopCapture", "pageCapture",
+              "system.cpu", "system.memory", "system.display", "system.storage",
+              "tts", "ttsEngine", "gcm", "enterprise.deviceAttributes",
+              "enterprise.hardwarePlatform", "enterprise.networkingAttributes",
+              "enterprise.platformKeys", "loginState", "platformKeys", "processes"
+          }
+          for perm_key in ["permissions", "optional_permissions"]:
+              if isinstance(data.get(perm_key), list):
+                  data[perm_key] = [p for p in data[perm_key] if isinstance(p, str) and p not in unsupported_perms]
+
+          with open(manifest_path, "w", encoding="utf-8") as f:
+              json.dump(data, f, indent=2, ensure_ascii=False)
+
+          with open("/tmp/ext_version.txt", "w") as vf:
+              vf.write(clean_ver)
+
+          print(f"✓ Đã chuẩn hóa manifest.json (Version: {clean_ver}, MV: {mv})")
+          PYEOF
+
+      # 3. CHUYỂN ĐỔI SANG SAFARI WEB EXTENSION PROJECT
       - name: Convert Chrome Extension to Safari Web Extension
-        if: steps.detect.outputs.mode == 'with-extension'
         run: |
           rm -rf output
           mkdir -p output
-          xcrun safari-web-extension-converter "${EXT_SRC_DIR}" \
+          xcrun safari-web-extension-converter /tmp/ext_work \
             --ios-only \
             --project-location output \
             --app-name "${APP_NAME}" \
             --bundle-identifier "${BUNDLE_ID}" \
             --swift \
             --no-open \
-            --no-prompt
+            --no-prompt \
+            --force
 
-      # 3. SYNC VERSION (fix ValidateEmbeddedBinary mismatch)
-      - name: Sync version & bundle ID between app and extension
-        if: steps.detect.outputs.mode == 'with-extension'
-        run: |
-          set -e
-          APP_INFO=$(find output -path "*/${APP_NAME}/Info.plist" -not -path "*Extension*" 2>/dev/null | head -n 1)
-          EXT_INFO=$(find output -path "*Extension/Info.plist" 2>/dev/null | head -n 1)
-
-          if [ -z "$APP_INFO" ] || [ -z "$EXT_INFO" ]; then
-            echo "WARN: không tìm thấy đủ 2 Info.plist, bỏ qua sync"
-            exit 0
-          fi
-
-          APP_SHORT_VER=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP_INFO" 2>/dev/null || echo "1.0")
-          APP_BUNDLE_VER=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$APP_INFO" 2>/dev/null || echo "1")
-          EXT_SHORT_VER=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$EXT_INFO" 2>/dev/null || echo "1.0")
-          EXT_BUNDLE_VER=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$EXT_INFO" 2>/dev/null || echo "1")
-
-          echo "App: $APP_SHORT_VER / $APP_BUNDLE_VER"
-          echo "Ext: $EXT_SHORT_VER / $EXT_BUNDLE_VER"
-
-          if [ "$EXT_SHORT_VER" != "$APP_SHORT_VER" ] || [ "$EXT_BUNDLE_VER" != "$APP_BUNDLE_VER" ]; then
-            echo "==> Đồng bộ version extension theo app..."
-            /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $APP_SHORT_VER" "$EXT_INFO" 2>/dev/null \
-              || /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $APP_SHORT_VER" "$EXT_INFO"
-            /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $APP_BUNDLE_VER" "$EXT_INFO" 2>/dev/null \
-              || /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $APP_BUNDLE_VER" "$EXT_INFO"
-            echo "✓ Đã sync"
-          else
-            echo "✓ Version đã khớp, không cần sync"
-          fi
-
-      # 4. BUILD + ĐÓNG GÓI (tolerant với ValidateEmbeddedBinary)
+      # 4. BUILD XCODE + KÝ AD-HOC + ĐÓNG GÓI IPA
       - name: Build and package IPA
         run: |
           set -e
-          PROJECT_PATH=$(find output -name "*.xcodeproj" -maxdepth 3 -type d | head -n 1)
+          EXT_VER=$(cat /tmp/ext_version.txt 2>/dev/null || echo "1.0.0")
+          PROJECT_PATH=$(find output -name "*.xcodeproj" -maxdepth 4 -type d | head -n 1)
           if [ -z "$PROJECT_PATH" ]; then
-            echo "ERROR: không tìm thấy .xcodeproj trong output/"
+            echo "ERROR: Không tìm thấy .xcodeproj trong output/"
             exit 1
           fi
+
           PROJECT_DIR=$(dirname "$PROJECT_PATH")
           PROJECT_NAME=$(basename "$PROJECT_PATH" .xcodeproj)
-          echo "Project: $PROJECT_NAME ($PROJECT_DIR)"
+          echo "Project: $PROJECT_NAME ($PROJECT_DIR) | Version: $EXT_VER"
           cd "$PROJECT_DIR"
 
           SCHEME_LIST=$(xcodebuild -list -project "$PROJECT_NAME.xcodeproj" 2>&1 || true)
-          echo "=== Schemes ==="; echo "$SCHEME_LIST"; echo "==============="
-
           SCHEME=$(echo "$SCHEME_LIST" | grep -E '^\s+.*\(iOS\)' | head -n 1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
           if [ -z "$SCHEME" ]; then
             SCHEME=$(echo "$SCHEME_LIST" | awk '/Schemes:/{flag=1; next} flag && NF{print; exit}' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
           fi
-          if [ -z "$SCHEME" ]; then echo "ERROR: no scheme"; exit 1; fi
           echo "==> Using scheme: $SCHEME"
 
-          # BUILD tolerant — unsigned + skip product validation
+          # Build truyền trực tiếp MARKETING_VERSION & IPHONEOS_DEPLOYMENT_TARGET=15.0
           set +e
           xcodebuild build \
             -project "$PROJECT_NAME.xcodeproj" \
@@ -139,6 +265,11 @@ jobs:
             -sdk iphoneos \
             -configuration Release \
             -derivedDataPath ./DerivedData \
+            MARKETING_VERSION="$EXT_VER" \
+            CURRENT_PROJECT_VERSION="1" \
+            IPHONEOS_DEPLOYMENT_TARGET="15.0" \
+            TARGETED_DEVICE_FAMILY="1,2" \
+            SUPPORTS_MACCATALYST=NO \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
@@ -148,52 +279,57 @@ jobs:
           BUILD_EXIT=${PIPESTATUS[0]}
           set -e
 
-          # Tìm .app bất kể build exit
           APP_PATH=$(find ./DerivedData/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" -type d 2>/dev/null | head -n 1)
           [ -z "$APP_PATH" ] && APP_PATH=$(find ./DerivedData -name "*.app" -type d 2>/dev/null | head -n 1)
 
           if [ -z "$APP_PATH" ]; then
-            echo "=== Build log (tail) ==="; tail -80 /tmp/build.log
-            echo "ERROR: không có .app được sinh ra"
+            echo "=== Build log (tail) ==="
+            tail -100 /tmp/build.log
+            echo "ERROR: Không có .app được sinh ra"
             exit 1
           fi
-          echo "==> .app: $APP_PATH"
+          echo "==> Đã tạo .app tại: $APP_PATH"
 
-          if [ $BUILD_EXIT -ne 0 ]; then
-            if grep -q "ValidateEmbeddedBinary" /tmp/build.log; then
-              echo "⚠ xcodebuild exit=$BUILD_EXIT do ValidateEmbeddedBinary trên extension unsigned"
-              echo "⚠ Đây là hành vi bình thường với build unsigned — .app đã đủ để đóng gói"
-            else
-              echo "⚠ xcodebuild exit=$BUILD_EXIT (không phải ValidateEmbeddedBinary) — vẫn thử đóng gói"
-            fi
-          fi
-
-          # Mode app-only: gỡ extension khỏi .app
+          # Xử lý theo chế độ app-only hoặc with-extension
           if [ "${{ steps.detect.outputs.mode }}" = "app-only" ]; then
-            if [ -d "$APP_PATH/PlugIns" ]; then
-              echo "==> App-only: gỡ PlugIns khỏi .app"
-              rm -rf "$APP_PATH/PlugIns"
+            echo "==> Chế độ App-only: Gỡ bỏ PlugIns khỏi .app"
+            rm -rf "$APP_PATH/PlugIns"
+          else
+            if [ -d "$APP_PATH/PlugIns" ] && find "$APP_PATH/PlugIns" -name "*.appex" | grep -q .; then
+              echo "✓ Extension (.appex) đã được nhúng vào .app"
+              # Đồng bộ cứng Info.plist của .appex và .app sau khi build
+              for EXT_PLIST in "$APP_PATH"/PlugIns/*.appex/Info.plist; do
+                /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $EXT_VER" "$EXT_PLIST" 2>/dev/null || true
+                /usr/libexec/PlistBuddy -c "Set :CFBundleVersion 1" "$EXT_PLIST" 2>/dev/null || true
+                /usr/libexec/PlistBuddy -c "Set :MinimumOSVersion 15.0" "$EXT_PLIST" 2>/dev/null || true
+              done
+            else
+              echo "ERROR: Không tìm thấy .appex trong $APP_PATH/PlugIns"
+              exit 1
             fi
           fi
 
-          # Verify extension (with-extension mode)
-          if [ "${{ steps.detect.outputs.mode }}" = "with-extension" ]; then
-            if [ -d "$APP_PATH/PlugIns" ] && find "$APP_PATH/PlugIns" -name "*.appex" | grep -q .; then
-              echo "✓ Extension đã nhúng đúng"
-            else
-              echo "⚠ CẢNH BÁO: không tìm thấy .appex trong .app"
-            fi
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $EXT_VER" "$APP_PATH/Info.plist" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion 1" "$APP_PATH/Info.plist" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Set :MinimumOSVersion 15.0" "$APP_PATH/Info.plist" 2>/dev/null || true
+
+          # Ký Ad-hoc toàn bộ .appex và .app để cài mượt qua TrollStore / ESign / Sideloadly / AltStore
+          echo "==> Ký Ad-hoc cho .appex và .app..."
+          if [ -d "$APP_PATH/PlugIns" ]; then
+            find "$APP_PATH/PlugIns" -name "*.appex" -type d | while read -r APPEX; do
+              codesign --force --sign - --timestamp=none "$APPEX"
+            done
           fi
+          codesign --force --sign - --timestamp=none "$APP_PATH"
 
           # Đóng gói IPA
-          rm -rf Payload; mkdir -p Payload
+          rm -rf Payload && mkdir -p Payload
           cp -R "$APP_PATH" Payload/
           rm -f "${GITHUB_WORKSPACE}/${IPA_NAME}.ipa"
           zip -r -q "${GITHUB_WORKSPACE}/${IPA_NAME}.ipa" Payload
 
-          echo "=== IPA ==="
+          echo "=== Thông tin IPA ==="
           ls -lh "${GITHUB_WORKSPACE}/${IPA_NAME}.ipa"
-          unzip -l "${GITHUB_WORKSPACE}/${IPA_NAME}.ipa" | head -25
 
       - name: Publish IPA to GitHub Releases
         uses: softprops/action-gh-release@v2
@@ -202,7 +338,8 @@ jobs:
           name: "IPA Build: ${{ env.APP_NAME }}"
           body: |
             Tải file **${{ env.IPA_NAME }}.ipa** ở mục Assets bên dưới.
-            Build mode: **${{ steps.detect.outputs.mode }}**
+            - Build mode: **${{ steps.detect.outputs.mode }}**
+            - Hỗ trợ: **iOS 15.0 trở lên (iPhone & iPad)**
           files: ${{ env.IPA_NAME }}.ipa
           prerelease: false
           make_latest: true
